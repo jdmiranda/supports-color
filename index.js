@@ -2,32 +2,66 @@ import process from 'node:process';
 import os from 'node:os';
 import tty from 'node:tty';
 
+// Precompile regex patterns for terminal detection (optimization)
+const TERM_256_REGEX = /-256(color)?$/i;
+const TERM_BASIC_REGEX = /^screen|^xterm|^vt100|^vt220|^rxvt|color|ansi|cygwin|linux/i;
+const TEAMCITY_VERSION_REGEX = /^(9\.(0*[1-9]\d*)\.|\d{2,}\.)/;
+
+// Cache for flag lookups (optimization)
+const flagCache = new Map();
+
 // From: https://github.com/sindresorhus/has-flag/blob/main/index.js
 /// function hasFlag(flag, argv = globalThis.Deno?.args ?? process.argv) {
 function hasFlag(flag, argv = globalThis.Deno ? globalThis.Deno.args : process.argv) {
+	// Memoize flag detection (optimization)
+	const cacheKey = `${flag}:${argv.join(':')}`;
+	if (flagCache.has(cacheKey)) {
+		return flagCache.get(cacheKey);
+	}
+
 	const prefix = flag.startsWith('-') ? '' : (flag.length === 1 ? '-' : '--');
 	const position = argv.indexOf(prefix + flag);
 	const terminatorPosition = argv.indexOf('--');
-	return position !== -1 && (terminatorPosition === -1 || position < terminatorPosition);
+	const result = position !== -1 && (terminatorPosition === -1 || position < terminatorPosition);
+
+	flagCache.set(cacheKey, result);
+	return result;
 }
 
 const {env} = process;
 
+// Cache flag force color detection (optimization)
 let flagForceColor;
-if (
-	hasFlag('no-color')
-	|| hasFlag('no-colors')
-	|| hasFlag('color=false')
-	|| hasFlag('color=never')
-) {
-	flagForceColor = 0;
-} else if (
-	hasFlag('color')
-	|| hasFlag('colors')
-	|| hasFlag('color=true')
-	|| hasFlag('color=always')
-) {
-	flagForceColor = 1;
+let cachedArgv = null;
+
+function getFlagForceColor() {
+	// Return cached value if argv hasn't changed (optimization)
+	const currentArgv = globalThis.Deno ? globalThis.Deno.args : process.argv;
+	if (cachedArgv === currentArgv && flagForceColor !== undefined) {
+		return flagForceColor;
+	}
+
+	cachedArgv = currentArgv;
+
+	if (
+		hasFlag('no-color')
+		|| hasFlag('no-colors')
+		|| hasFlag('color=false')
+		|| hasFlag('color=never')
+	) {
+		flagForceColor = 0;
+	} else if (
+		hasFlag('color')
+		|| hasFlag('colors')
+		|| hasFlag('color=true')
+		|| hasFlag('color=always')
+	) {
+		flagForceColor = 1;
+	} else {
+		flagForceColor = undefined;
+	}
+
+	return flagForceColor;
 }
 
 function envForceColor() {
@@ -69,28 +103,111 @@ function translateLevel(level) {
 	};
 }
 
-function _supportsColor(haveStream, {streamIsTTY, sniffFlags = true} = {}) {
-	const noFlagForceColor = envForceColor();
-	if (noFlagForceColor !== undefined) {
-		flagForceColor = noFlagForceColor;
+// Cache for Windows version check (optimization)
+let windowsVersionCache = null;
+
+function getWindowsVersion() {
+	if (windowsVersionCache !== null) {
+		return windowsVersionCache;
 	}
 
-	const forceColor = sniffFlags ? flagForceColor : noFlagForceColor;
+	const osRelease = os.release().split('.');
+	windowsVersionCache = {
+		major: Number(osRelease[0]),
+		minor: Number(osRelease[1]),
+		build: Number(osRelease[2]),
+	};
+
+	return windowsVersionCache;
+}
+
+// Helper: Check for terminal-specific color support (optimization)
+function checkTerminalColorSupport(env) {
+	if (env.COLORTERM === 'truecolor') {
+		return 3;
+	}
+
+	if (env.TERM === 'xterm-kitty' || env.TERM === 'xterm-ghostty' || env.TERM === 'wezterm') {
+		return 3;
+	}
+
+	if ('TERM_PROGRAM' in env) {
+		const version = Number.parseInt((env.TERM_PROGRAM_VERSION || '').split('.')[0], 10);
+
+		switch (env.TERM_PROGRAM) {
+			case 'iTerm.app': {
+				return version >= 3 ? 3 : 2;
+			}
+
+			case 'Apple_Terminal': {
+				return 2;
+			}
+			// No default
+		}
+	}
+
+	if (TERM_256_REGEX.test(env.TERM)) {
+		return 2;
+	}
+
+	if (TERM_BASIC_REGEX.test(env.TERM)) {
+		return 1;
+	}
+
+	if ('COLORTERM' in env) {
+		return 1;
+	}
+
+	return 0;
+}
+
+// Helper: Check CI environment color support (optimization)
+function checkCIColorSupport(env, min) {
+	if (['GITHUB_ACTIONS', 'GITEA_ACTIONS', 'CIRCLECI'].some(key => key in env)) {
+		return 3;
+	}
+
+	if (['TRAVIS', 'APPVEYOR', 'GITLAB_CI', 'BUILDKITE', 'DRONE'].some(sign => sign in env) || env.CI_NAME === 'codeship') {
+		return 1;
+	}
+
+	return min;
+}
+
+// Helper: Check flag-based color level (optimization)
+function checkFlagColorLevel(sniffFlags) {
+	if (!sniffFlags) {
+		return 0;
+	}
+
+	if (hasFlag('color=16m') || hasFlag('color=full') || hasFlag('color=truecolor')) {
+		return 3;
+	}
+
+	if (hasFlag('color=256')) {
+		return 2;
+	}
+
+	return 0;
+}
+
+function _supportsColor(haveStream, {streamIsTTY, sniffFlags = true} = {}) {
+	const noFlagForceColor = envForceColor();
+	let localFlagForceColor = getFlagForceColor();
+
+	if (noFlagForceColor !== undefined) {
+		localFlagForceColor = noFlagForceColor;
+	}
+
+	const forceColor = sniffFlags ? localFlagForceColor : noFlagForceColor;
 
 	if (forceColor === 0) {
 		return 0;
 	}
 
-	if (sniffFlags) {
-		if (hasFlag('color=16m')
-			|| hasFlag('color=full')
-			|| hasFlag('color=truecolor')) {
-			return 3;
-		}
-
-		if (hasFlag('color=256')) {
-			return 2;
-		}
+	const flagLevel = checkFlagColorLevel(sniffFlags);
+	if (flagLevel > 0) {
+		return flagLevel;
 	}
 
 	// Check for Azure DevOps pipelines.
@@ -112,74 +229,29 @@ function _supportsColor(haveStream, {streamIsTTY, sniffFlags = true} = {}) {
 	if (process.platform === 'win32') {
 		// Windows 10 build 10586 is the first Windows release that supports 256 colors.
 		// Windows 10 build 14931 is the first release that supports 16m/TrueColor.
-		const osRelease = os.release().split('.');
+		const windowsVersion = getWindowsVersion();
 		if (
-			Number(osRelease[0]) >= 10
-			&& Number(osRelease[2]) >= 10_586
+			windowsVersion.major >= 10
+			&& windowsVersion.build >= 10_586
 		) {
-			return Number(osRelease[2]) >= 14_931 ? 3 : 2;
+			return windowsVersion.build >= 14_931 ? 3 : 2;
 		}
 
 		return 1;
 	}
 
 	if ('CI' in env) {
-		if (['GITHUB_ACTIONS', 'GITEA_ACTIONS', 'CIRCLECI'].some(key => key in env)) {
-			return 3;
-		}
-
-		if (['TRAVIS', 'APPVEYOR', 'GITLAB_CI', 'BUILDKITE', 'DRONE'].some(sign => sign in env) || env.CI_NAME === 'codeship') {
-			return 1;
-		}
-
-		return min;
+		return checkCIColorSupport(env, min);
 	}
 
 	if ('TEAMCITY_VERSION' in env) {
-		return /^(9\.(0*[1-9]\d*)\.|\d{2,}\.)/.test(env.TEAMCITY_VERSION) ? 1 : 0;
+		return TEAMCITY_VERSION_REGEX.test(env.TEAMCITY_VERSION) ? 1 : 0;
 	}
 
-	if (env.COLORTERM === 'truecolor') {
-		return 3;
-	}
-
-	if (env.TERM === 'xterm-kitty') {
-		return 3;
-	}
-
-	if (env.TERM === 'xterm-ghostty') {
-		return 3;
-	}
-
-	if (env.TERM === 'wezterm') {
-		return 3;
-	}
-
-	if ('TERM_PROGRAM' in env) {
-		const version = Number.parseInt((env.TERM_PROGRAM_VERSION || '').split('.')[0], 10);
-
-		switch (env.TERM_PROGRAM) {
-			case 'iTerm.app': {
-				return version >= 3 ? 3 : 2;
-			}
-
-			case 'Apple_Terminal': {
-				return 2;
-			}
-			// No default
-		}
-	}
-
-	if (/-256(color)?$/i.test(env.TERM)) {
-		return 2;
-	}
-
-	if (/^screen|^xterm|^vt100|^vt220|^rxvt|color|ansi|cygwin|linux/i.test(env.TERM)) {
-		return 1;
-	}
-
-	if ('COLORTERM' in env) {
-		return 1;
+	// Check terminal-specific support
+	const terminalLevel = checkTerminalColorSupport(env);
+	if (terminalLevel > 0) {
+		return terminalLevel;
 	}
 
 	return min;
@@ -194,9 +266,34 @@ export function createSupportsColor(stream, options = {}) {
 	return translateLevel(level);
 }
 
+// Export cache clearing function for testing/advanced use (optimization)
+export function clearCache() {
+	flagCache.clear();
+	windowsVersionCache = null;
+	cachedArgv = null;
+	flagForceColor = undefined;
+}
+
+// Lazy initialization for stdout/stderr (optimization)
+let stdoutCache = null;
+let stderrCache = null;
+
 const supportsColor = {
-	stdout: createSupportsColor({isTTY: tty.isatty(1)}),
-	stderr: createSupportsColor({isTTY: tty.isatty(2)}),
+	get stdout() {
+		if (stdoutCache === null) {
+			stdoutCache = createSupportsColor({isTTY: tty.isatty(1)});
+		}
+
+		return stdoutCache;
+	},
+
+	get stderr() {
+		if (stderrCache === null) {
+			stderrCache = createSupportsColor({isTTY: tty.isatty(2)});
+		}
+
+		return stderrCache;
+	},
 };
 
 export default supportsColor;

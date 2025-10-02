@@ -47,6 +47,11 @@ export type ColorInfo = ColorSupport | false;
 
 export function createSupportsColor(stream?: WriteStream, options?: Options): ColorInfo;
 
+/**
+Clear internal caches. Useful for testing or when environment changes dynamically.
+*/
+export function clearCache(): void;
+
 declare const supportsColor: {
 	stdout: ColorInfo;
 	stderr: ColorInfo;
